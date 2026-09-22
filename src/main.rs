@@ -55,6 +55,9 @@ pub struct App {
     /// two have different threat models, and a batch install run with a stale
     /// key must not lock the operator out of the panel.
     pub registrations: auth::Throttle,
+    /// GitHub OAuth 回调端的失败计数。回调是公网匿名端点,失败的
+    /// `login_failed` 通知必须限流——详见 `auth::CallbackThrottle`。
+    pub callback_throttle: auth::CallbackThrottle,
     pub http: reqwest::Client,
     /// 插件 http 专用 client。与 `http` 分开的唯一原因是重定向策略:
     /// `reqwest` 0.12 只能在 Client 上设,而宿主自身的调用(GitHub release、
@@ -96,6 +99,7 @@ impl App {
             quality: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
+            callback_throttle: auth::CallbackThrottle::default(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
@@ -452,6 +456,7 @@ async fn main() -> Result<()> {
         // routes, because a plugin tar.gz is megabytes against this layer's
         // 64 KiB ceiling; everything else is a few bytes of id and key.
         .route("/api/plugins", get(api_plugins::list_plugins))
+        .route("/api/plugins/{id}/export", get(api_plugins::export_plugin))
         .route("/api/plugins/{id}", delete(api_plugins::delete_plugin))
         .route("/api/plugins/{id}/enable", post(api_plugins::enable_plugin))
         .route("/api/plugins/{id}/disable", post(api_plugins::disable_plugin))
@@ -481,16 +486,21 @@ async fn main() -> Result<()> {
             Router::new()
                 .route("/api/db/restore", post(api::db_restore))
                 .route("/api/themes", post(api::upload_theme))
-                // A plugin package is uploaded in one request, bounded by
-                // api_plugins::MAX_PLUGIN on the handler itself; this layer's job is
-                // only to let those bytes past the 64 KiB ceiling above.
-                .route("/api/plugins", post(api_plugins::upload_plugin))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_CHUNK))
-                // The multipart extractor applies its own default body limit on
-                // top of the layer above, and that default is 2 MiB -- without
-                // this a plugin tar.gz between 2 and 8 MiB fails parsing. The
-                // two other routes here take the raw body and never see it.
-                .layer(axum::extract::DefaultBodyLimit::max(api::MAX_CHUNK))
+                .with_state(app.clone()),
+        )
+        // The plugin upload has its own body-limit layer, separate from the
+        // chunked routes above: a data-bearing package is one request that must
+        // hold a full plugin's data plus its wasm module, so both this layer and
+        // the multipart extractor's own default are set to MAX_PLUGIN (32 MiB) --
+        // not MAX_CHUNK (8 MiB), which stays the ceiling the backup/theme routes
+        // and any reverse proxy still track for those. A reverse proxy must pass
+        // 32 MiB for the plugin upload route specifically.
+        .merge(
+            Router::new()
+                .route("/api/plugins", post(api_plugins::upload_plugin))
+                .layer(tower_http::limit::RequestBodyLimitLayer::new(api_plugins::MAX_PLUGIN as usize))
+                .layer(axum::extract::DefaultBodyLimit::max(api_plugins::MAX_PLUGIN as usize))
                 .with_state(app.clone()),
         )
         // Excludes the agent binary and database backups: both are already
